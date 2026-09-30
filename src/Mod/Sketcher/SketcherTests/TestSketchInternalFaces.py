@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 import math
+import os
+import re
+import tempfile
 import unittest
+import zipfile
 
 import FreeCAD
 import Part
@@ -74,6 +78,57 @@ def add_figure8_bspline(sketch):
     bs.interpolate(pts)
     sketch.addGeometry(bs)
     return i
+
+
+# Pole P1 x-coordinates for add_near_tangent_junction(): where the BSpline leaves the arc at A.
+NEAR_TANGENT_P1X = -10.078998521571107  # 0.13 deg inside the arc tangent
+TANGENT_P1X = -10.091646489730138  # exactly along the arc tangent
+STEEP_P1X = -9.528400467138  # 5 deg inside the arc tangent
+
+
+def add_near_tangent_junction(sketch, p1x):
+    """Region bounded by an R24.5 arc C -> A, a degree-2 BSpline A -> B and a line B -> C.
+
+    The BSpline start direction at A is set by pole P1 = (p1x, 22.5). When it points slightly
+    inside the arc, the BSpline dips into the circle and crosses the arc again 0.035 mm past A.
+    Returns the geometry index of the BSpline."""
+    A = App.Vector(-12.5, 21.071307505705477, 0)
+    B = App.Vector(-9.499999999999991, 24.5, 0)
+    C = App.Vector(0, 24.5, 0)
+    circle = Part.Circle(App.Vector(), App.Vector(0, 0, 1), 24.5)
+    sketch.addGeometry(Part.ArcOfCircle(circle, math.pi / 2, math.atan2(A.y, A.x)))
+    bspline = Part.BSplineCurve()
+    bspline.buildFromPoles([A, App.Vector(p1x, 22.5, 0), B], False, 2)
+    index = sketch.addGeometry(bspline)
+    sketch.addGeometry(Part.LineSegment(B, C))
+    return index
+
+
+def reopen_with_legacy_internal_faces(doc):
+    """Save doc, mark its sketches as built with the legacy face maker, and reopen it.
+
+    _InternalFaceVersion is read-only, and a sketch only gets version 1 (FaceMakerRing) when it
+    comes from a file saved by FreeCAD 1.1 or earlier. Returns the reopened document; the
+    original one is closed."""
+    path = os.path.join(tempfile.mkdtemp(), doc.Name + ".FCStd")
+    doc.saveAs(path)
+    FreeCAD.closeDocument(doc.Name)
+
+    archive = zipfile.ZipFile(path)
+    members = {name: archive.read(name) for name in archive.namelist()}
+    archive.close()
+    document = members["Document.xml"].decode("utf-8")
+    document = re.sub(
+        r'(<Property name="_InternalFaceVersion"[^>]*>\s*<Integer value=")\d+(")',
+        r"\g<1>1\2",
+        document,
+    )
+    members["Document.xml"] = document.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as rewritten:
+        for name, data in members.items():
+            rewritten.writestr(name, data)
+
+    return FreeCAD.openDocument(path)
 
 
 def get_internal_faces(sketch):
@@ -717,3 +772,68 @@ class TestSketchInternalFaces(unittest.TestCase):
         face_names = [name for name in shape.ElementReverseMap.keys() if name.startswith("Face")]
         self.assertEqual(len(face_names), len(set(face_names)))
         self.assertEqual(len(face_names), 3, "Should have 3 face names for 3 faces")
+
+    # ==================================================================
+    # 12. Near-tangent crossings: boundary that crosses itself
+    # ==================================================================
+
+    def _near_tangent_legacy_sketch(self, p1x):
+        sk = self._make_sketch()
+        add_near_tangent_junction(sk, p1x)
+        self.Doc.recompute()
+        name = sk.Name
+        self.Doc = reopen_with_legacy_internal_faces(self.Doc)
+        sk = self.Doc.getObject(name)
+        self.assertEqual(sk._InternalFaceVersion, 1)
+        sk.touch()
+        self.Doc.recompute()
+        return sk
+
+    def testNearTangentCrossingIsSplit(self):
+        """A BSpline leaving an arc 0.13 deg inside its tangent crosses the arc again 0.035 mm
+        later. The crossing is split off into a sliver face, and no face crosses itself."""
+        sk = self._make_sketch()
+        add_near_tangent_junction(sk, NEAR_TANGENT_P1X)
+        self.Doc.recompute()
+        self.assertNotIn("Invalid", sk.State)
+        faces = get_internal_faces(sk)
+        self.assertEqual(len(faces), 2)
+        for face in faces:
+            face.check(True)
+
+    def testSteepCrossingIsSplit(self):
+        """At 5 deg inside the tangent the crossing is split off into a separate face."""
+        sk = self._make_sketch()
+        add_near_tangent_junction(sk, STEEP_P1X)
+        self.Doc.recompute()
+        self.assertNotIn("Invalid", sk.State)
+        self.assertEqual(len(get_internal_faces(sk)), 2)
+
+    def testLegacyNearTangentCrossingIsError(self):
+        """The legacy face maker misses the crossing and builds one face whose boundary
+        crosses itself. The sketch must report it instead of passing it on."""
+        sk = self._near_tangent_legacy_sketch(NEAR_TANGENT_P1X)
+        self.assertIn("Invalid", sk.State)
+        self.assertIn(
+            "InternalFace1 boundary crosses itself near (-12.5000, 21.0713)",
+            sk.getStatusString(),
+        )
+
+    def testLegacyTangentJunctionIsValid(self):
+        """With a tangent junction the legacy face maker builds one clean face."""
+        sk = self._near_tangent_legacy_sketch(TANGENT_P1X)
+        self.assertNotIn("Invalid", sk.State)
+        self.assertEqual(len(get_internal_faces(sk)), 1)
+
+    def testLegacyNearTangentCrossingIgnoredWithoutInternals(self):
+        """With MakeInternals off there are no regions, so nothing to report."""
+        sk = self._make_sketch()
+        sk.MakeInternals = False
+        add_near_tangent_junction(sk, NEAR_TANGENT_P1X)
+        self.Doc.recompute()
+        name = sk.Name
+        self.Doc = reopen_with_legacy_internal_faces(self.Doc)
+        sk = self.Doc.getObject(name)
+        sk.touch()
+        self.Doc.recompute()
+        self.assertNotIn("Invalid", sk.State)

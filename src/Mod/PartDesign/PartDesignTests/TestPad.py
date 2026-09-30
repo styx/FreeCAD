@@ -27,6 +27,12 @@ import FreeCAD
 import Part
 from FreeCAD import Base
 import TestSketcherApp
+from SketcherTests.TestSketchInternalFaces import (
+    NEAR_TANGENT_P1X,
+    TANGENT_P1X,
+    add_near_tangent_junction,
+    reopen_with_legacy_internal_faces,
+)
 
 
 class TestPad(unittest.TestCase):
@@ -356,6 +362,41 @@ class TestPad(unittest.TestCase):
         self.Pad.UpToFace = (self.Doc.XZ_Plane, [""])
         self.Doc.recompute()
         self.assertAlmostEqual(self.Pad.Shape.Volume, 1.5)
+
+    def testPadKeepsShapeWhenInternalFaceCrosses(self):
+        """A sketch region whose boundary crosses itself puts the sketch in error, so the
+        Pad is not recomputed and keeps its last good shape instead of an empty one.
+        Only the legacy face maker (files saved by FreeCAD 1.1 and earlier) builds such a region."""
+        self.Body = self.Doc.addObject("PartDesign::Body", "Body")
+        self.PadSketch = self.Body.newObject("Sketcher::SketchObject", "SketchPad")
+        self.PadSketch.MakeInternals = True
+        bspline = add_near_tangent_junction(self.PadSketch, TANGENT_P1X)
+        self.Pad = self.Body.newObject("PartDesign::Pad", "Pad")
+        self.Pad.Profile = self.PadSketch
+        self.Pad.Length = 5
+        self.Doc.recompute()
+
+        self.Doc = reopen_with_legacy_internal_faces(self.Doc)
+        self.PadSketch = self.Doc.getObject("SketchPad")
+        self.Pad = self.Doc.getObject("Pad")
+        self.assertEqual(self.PadSketch._InternalFaceVersion, 1)
+        self.PadSketch.touch()
+        self.Doc.recompute()
+        self.assertEqual(len(self.Pad.Shape.Solids), 1)
+        volume = self.Pad.Shape.Volume
+
+        # Replace the BSpline with one that leaves the arc 0.13 deg inside its tangent
+        poles = self.PadSketch.Geometry[bspline].getPoles()
+        poles[1].x = NEAR_TANGENT_P1X
+        nearTangent = Part.BSplineCurve()
+        nearTangent.buildFromPoles(poles, False, 2)
+        self.PadSketch.delGeometry(bspline)
+        self.PadSketch.addGeometry(nearTangent)
+        self.Doc.recompute()
+
+        self.assertIn("Invalid", self.PadSketch.State)
+        self.assertEqual(len(self.Pad.Shape.Solids), 1)
+        self.assertAlmostEqual(self.Pad.Shape.Volume, volume, places=6)
 
     def tearDown(self):
         # closing doc

@@ -24,8 +24,14 @@
 
 #include <algorithm>
 
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
+#include <BOPAlgo_CheckResult.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
+#include <BRep_Tool.hxx>
+#include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
 #include <GCPnts_AbscissaPoint.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Shape.hxx>
@@ -313,6 +319,71 @@ GCS::Algorithm getDefaultSolver()
     }
     return static_cast<GCS::Algorithm>(solver);
 }
+
+struct CrossingInternalFace
+{
+    int index;  // 1-based, same numbering as InternalFaceN
+    gp_Pnt near;
+};
+
+// A point to show the user for a self-intersection found by BOPAlgo_ArgumentAnalyzer.
+// A near-tangent crossing lies just past the vertex shared by the two crossing edges,
+// so report that vertex, or else the closest point between the two edges.
+gp_Pnt crossingHint(const BOPAlgo_CheckResult& result)
+{
+    const TopTools_ListOfShape& faulty = result.GetFaultyShapes1();
+    std::vector<TopoDS_Edge> edges;
+    for (const auto& shape : faulty) {
+        if (shape.ShapeType() == TopAbs_EDGE) {
+            edges.push_back(TopoDS::Edge(shape));
+        }
+    }
+    if (edges.size() >= 2) {
+        TopoDS_Vertex common;
+        if (TopExp::CommonVertex(edges[0], edges[1], common)) {
+            return BRep_Tool::Pnt(common);
+        }
+        BRepExtrema_DistShapeShape dist(edges[0], edges[1]);
+        if (dist.IsDone() && dist.NbSolution() > 0) {
+            return dist.PointOnShape1(1);
+        }
+    }
+    for (const auto& shape : faulty) {
+        TopExp_Explorer xp(shape, TopAbs_VERTEX);
+        if (xp.More()) {
+            return BRep_Tool::Pnt(TopoDS::Vertex(xp.Current()));
+        }
+    }
+    return {};
+}
+
+// Internal faces whose boundary crosses itself. FaceMakerBuildFace can miss a crossing
+// right after a near-tangent junction and then builds a face whose boundary forms a tiny
+// figure-8. BRepCheck accepts such a face, but booleans that use it fail silently.
+std::vector<CrossingInternalFace> findSelfIntersectingInternalFaces(const Part::TopoShape& internals)
+{
+    std::vector<CrossingInternalFace> bad;
+    int index = 0;
+    for (const auto& face : internals.getSubTopoShapes(TopAbs_FACE)) {
+        ++index;
+        BOPAlgo_ArgumentAnalyzer check;
+        check.SetShape1(face.getShape());
+        check.SelfInterMode() = true;
+        check.Perform();
+        if (!check.HasFaulty()) {
+            continue;
+        }
+        gp_Pnt near;
+        for (const auto& result : check.GetCheckResult()) {
+            if (result.GetCheckStatus() == BOPAlgo_SelfIntersect) {
+                near = crossingHint(result);
+                break;
+            }
+        }
+        bad.push_back({index, near});
+    }
+    return bad;
+}
 } // namespace
 
 App::DocumentObjectExecReturn* SketchObject::execute()
@@ -378,6 +449,23 @@ App::DocumentObjectExecReturn* SketchObject::execute()
     // this is not necessary for sketch representation in edit mode, unless we want to trigger an
     // update of the objects that depend on this sketch (like pads)
     buildShape();
+
+    // InternalShape has no placement, so the reported points are in sketch coordinates.
+    auto crossing = findSelfIntersectingInternalFaces(InternalShape.getShape());
+    if (!crossing.empty()) {
+        std::ostringstream str;
+        str << std::fixed << std::setprecision(4);
+        for (const auto& face : crossing) {
+            if (face.index != crossing.front().index) {
+                str << "; ";
+            }
+            str << "InternalFace" << face.index << " boundary crosses itself near ("
+                << face.near.X() << ", " << face.near.Y() << ")";
+        }
+        str << ". Edges that meet almost tangentially cross again just after the shared "
+               "point. Add a Tangent constraint there, or change the angle.";
+        return new App::DocumentObjectExecReturn(str.str(), this);
+    }
 
     return App::DocumentObject::StdReturn;
 }
